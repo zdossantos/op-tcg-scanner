@@ -1,7 +1,9 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
+import 'package:image/image.dart' as img;
 import '../services/vision_service.dart';
 import '../services/cardmarket_service.dart';
 import '../models/card_model.dart';
@@ -26,7 +28,16 @@ class _ScannerScreenState extends State<ScannerScreen>
   bool _isScanning = false;
   String? _errorMessage;
 
+  // Auto-scan
+  bool _autoScanEnabled = false;
+  bool _isAutoProcessing = false;
+  String? _detectedCardNumber;
+  Timer? _autoScanTimer;
+
   late final AnimationController _laserController;
+
+  /// Clé globale sur le cadre de scan pour connaître sa position exacte
+  final GlobalKey _frameKey = GlobalKey();
 
   @override
   void initState() {
@@ -41,6 +52,7 @@ class _ScannerScreenState extends State<ScannerScreen>
 
   @override
   void dispose() {
+    _autoScanTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _cameraController?.dispose();
     _visionService.dispose();
@@ -53,9 +65,13 @@ class _ScannerScreenState extends State<ScannerScreen>
     final controller = _cameraController;
     if (controller == null || !controller.value.isInitialized) return;
     if (state == AppLifecycleState.inactive) {
+      _autoScanTimer?.cancel();
+      _autoScanTimer = null;
       controller.dispose();
     } else if (state == AppLifecycleState.resumed) {
-      _initCamera();
+      _initCamera().then((_) {
+        if (_autoScanEnabled && mounted) _startAutoScanTimer();
+      });
     }
   }
 
@@ -83,69 +99,201 @@ class _ScannerScreenState extends State<ScannerScreen>
     }
   }
 
+  // ─── Auto-scan ──────────────────────────────────────────────────────────────
+
+  void _toggleAutoScan() {
+    if (_autoScanEnabled) {
+      _autoScanTimer?.cancel();
+      _autoScanTimer = null;
+      setState(() { _autoScanEnabled = false; _detectedCardNumber = null; });
+    } else {
+      setState(() { _autoScanEnabled = true; _detectedCardNumber = null; _errorMessage = null; });
+      _startAutoScanTimer();
+    }
+  }
+
+  void _startAutoScanTimer() {
+    _autoScanTimer?.cancel();
+    _autoScanTimer = Timer.periodic(const Duration(milliseconds: 1800), (_) => _autoScanTick());
+  }
+
+  Future<void> _autoScanTick() async {
+    if (!mounted || _isScanning || _isAutoProcessing) return;
+    if (_cameraController == null || !_cameraController!.value.isInitialized) return;
+
+    _isAutoProcessing = true;
+    try {
+      final imageFile = await _cameraController!.takePicture();
+      final croppedPath = await _cropImageToFrame(imageFile.path);
+      final scanResult = await _visionService.recognizeCard(croppedPath ?? imageFile.path);
+      if (croppedPath != null) try { await File(croppedPath).delete(); } catch (_) {}
+      try { await File(imageFile.path).delete(); } catch (_) {}
+
+      if (!mounted || scanResult.cardNumber == null) return;
+
+      // Carte détectée → pause timer + feedback visuel + scan complet
+      _autoScanTimer?.cancel();
+      _autoScanTimer = null;
+      setState(() {
+        _detectedCardNumber = scanResult.cardNumber;
+        _isScanning = true;
+        _errorMessage = null;
+      });
+
+      await _performScan(scanResult);
+
+      if (mounted && _autoScanEnabled) {
+        setState(() { _detectedCardNumber = null; _isScanning = false; });
+        _startAutoScanTimer();
+      }
+    } catch (_) {
+      // Ignore silencieusement les erreurs en auto-scan
+    } finally {
+      _isAutoProcessing = false;
+    }
+  }
+
+  // ─── Scan manuel ────────────────────────────────────────────────────────────
+
   Future<void> _captureAndScan() async {
     if (_isScanning || _cameraController == null) return;
     if (!_cameraController!.value.isInitialized) return;
+
+    // Pause l'auto-scan pendant le scan manuel
+    _autoScanTimer?.cancel();
+    _autoScanTimer = null;
 
     setState(() { _isScanning = true; _errorMessage = null; });
 
     try {
       final XFile imageFile = await _cameraController!.takePicture();
-      final scanResult = await _visionService.recognizeCard(imageFile.path);
+      final croppedPath = await _cropImageToFrame(imageFile.path);
+      final scanResult = await _visionService.recognizeCard(croppedPath ?? imageFile.path);
+      if (croppedPath != null) try { await File(croppedPath).delete(); } catch (_) {}
+      try { await File(imageFile.path).delete(); } catch (_) {}
 
       if (!scanResult.isValid) {
         _showError('Aucune carte détectée. Assurez-vous que le numéro (ex: OP01-001) est visible.');
         return;
       }
-
-      List<CardModel>? cards;
-      String? warningMessage;
-
-      try {
-        cards = await _cardmarketService.searchCard(
-          cardNumber: scanResult.cardNumber,
-          cardName: scanResult.cardName,
-        );
-      } on CardmarketException catch (e) {
-        if (e.isBlocked) {
-          warningMessage = e.message;
-          final cardId = scanResult.cardNumber ??
-              (scanResult.cardName ?? 'unknown').replaceAll(' ', '_').toLowerCase();
-          cards = [
-            CardModel(
-              id: cardId,
-              name: scanResult.cardName ?? 'Carte scannée',
-              cardNumber: scanResult.cardNumber ?? '',
-              edition: 'One Piece TCG',
-              rarity: CardRarity.unknown,
-              scannedAt: DateTime.now(),
-              cardmarketUrl: scanResult.cardNumber != null
-                  ? 'https://www.cardmarket.com/en/OnePiece/Products/Singles?searchString=${Uri.encodeComponent(scanResult.cardNumber!)}'
-                  : null,
-            ),
-          ];
-        } else {
-          _showError(e.message);
-          return;
-        }
-      }
-
-      try { await File(imageFile.path).delete(); } catch (_) {}
-
-      if (!mounted) return;
-
-      if (cards.length == 1) {
-        await _navigateToResult(cards.first, warningMessage);
-      } else {
-        setState(() => _isScanning = false);
-        await _showVariantSelector(cards, warningMessage);
-      }
+      await _performScan(scanResult);
     } on CardmarketException catch (e) {
       _showError(e.message);
     } catch (e) {
       _showError('Erreur inattendue lors du scan. Veuillez réessayer.');
     } finally {
+      if (mounted) {
+        setState(() => _isScanning = false);
+        if (_autoScanEnabled) _startAutoScanTimer();
+      }
+    }
+  }
+
+  // ─── Traitement commun (API + navigation) ───────────────────────────────────
+
+  Future<void> _performScan(CardScanResult scanResult) async {
+    List<CardModel>? cards;
+    String? warningMessage;
+
+    try {
+      cards = await _cardmarketService.searchCard(
+        cardNumber: scanResult.cardNumber,
+        cardName: scanResult.cardName,
+      );
+    } on CardmarketException catch (e) {
+      if (e.isBlocked) {
+        warningMessage = e.message;
+        final cardId = scanResult.cardNumber ??
+            (scanResult.cardName ?? 'unknown').replaceAll(' ', '_').toLowerCase();
+        cards = [
+          CardModel(
+            id: cardId,
+            name: scanResult.cardName ?? 'Carte scannée',
+            cardNumber: scanResult.cardNumber ?? '',
+            edition: 'One Piece TCG',
+            rarity: CardRarity.unknown,
+            scannedAt: DateTime.now(),
+            cardmarketUrl: scanResult.cardNumber != null
+                ? 'https://www.cardmarket.com/en/OnePiece/Products/Singles?searchString=${Uri.encodeComponent(scanResult.cardNumber!)}'
+                : null,
+          ),
+        ];
+      } else {
+        if (mounted) _showError(e.message);
+        return;
+      }
+    }
+
+    if (!mounted) return;
+
+    if (cards.length == 1) {
+      await _navigateToResult(cards.first, warningMessage);
+    } else {
       if (mounted) setState(() => _isScanning = false);
+      await _showVariantSelector(cards, warningMessage);
+    }
+  }
+
+  /// Recadre l'image capturée aux coordonnées exactes du cadre de scan affiché.
+  ///
+  /// Utilise le [_frameKey] pour obtenir la position réelle du cadre sur l'écran,
+  /// puis mappe ces coordonnées vers les pixels de l'image capturée en tenant
+  /// compte du letterboxing du CameraPreview.
+  Future<String?> _cropImageToFrame(String imagePath) async {
+    try {
+      if (_frameKey.currentContext == null) return null;
+
+      // Position exacte du cadre sur l'écran
+      final renderBox = _frameKey.currentContext!.findRenderObject() as RenderBox;
+      final frameOffset = renderBox.localToGlobal(Offset.zero);
+      final frameSize = renderBox.size;
+      final screenSize = MediaQuery.of(context).size;
+
+      // Charge et oriente l'image (corrige l'EXIF iOS/Android)
+      final bytes = await File(imagePath).readAsBytes();
+      img.Image? image = img.decodeImage(bytes);
+      if (image == null) return null;
+      image = img.bakeOrientation(image);
+
+      final imgW = image.width.toDouble();
+      final imgH = image.height.toDouble();
+      final screenW = screenSize.width;
+      final screenH = screenSize.height;
+
+      // Le CameraPreview utilise AspectRatio → letterboxing possible
+      final cameraAspect = imgW / imgH;
+      final screenAspect = screenW / screenH;
+
+      double previewW, previewH, offsetX = 0, offsetY = 0;
+      if (cameraAspect > screenAspect) {
+        // Préview remplit la largeur, barres noires haut/bas
+        previewW = screenW;
+        previewH = screenW / cameraAspect;
+        offsetY = (screenH - previewH) / 2;
+      } else {
+        // Préview remplit la hauteur, barres noires gauche/droite
+        previewH = screenH;
+        previewW = screenH * cameraAspect;
+        offsetX = (screenW - previewW) / 2;
+      }
+
+      // Facteurs d'échelle préview → pixels image
+      final scaleX = imgW / previewW;
+      final scaleY = imgH / previewH;
+
+      // Coordonnées du cadre dans l'image
+      final x = ((frameOffset.dx - offsetX) * scaleX).round().clamp(0, image.width - 1);
+      final y = ((frameOffset.dy - offsetY) * scaleY).round().clamp(0, image.height - 1);
+      final w = (frameSize.width * scaleX).round().clamp(1, image.width - x);
+      final h = (frameSize.height * scaleY).round().clamp(1, image.height - y);
+
+      final cropped = img.copyCrop(image, x: x, y: y, width: w, height: h);
+
+      final croppedPath = imagePath.replaceFirst('.jpg', '_crop.jpg');
+      await File(croppedPath).writeAsBytes(img.encodeJpg(cropped, quality: 95));
+      return croppedPath;
+    } catch (_) {
+      return null; // En cas d'erreur, on utilise l'image complète
     }
   }
 
@@ -259,7 +407,7 @@ class _ScannerScreenState extends State<ScannerScreen>
                                         ? Image.network(
                                             card.imageUrl!,
                                             fit: BoxFit.cover,
-                                            errorBuilder: (_, __, ___) => Container(
+                                            errorBuilder: (context, error, stack) => Container(
                                               color: const Color(0xFF12122A),
                                               child: const Center(child: Icon(Icons.style, color: Color(0xFFC0392B), size: 40)),
                                             ),
@@ -427,7 +575,7 @@ class _ScannerScreenState extends State<ScannerScreen>
             child: Image.asset(
               'assets/images/logo.png',
               fit: BoxFit.cover,
-              errorBuilder: (_, __, ___) => const Icon(
+              errorBuilder: (context, error, stack) => const Icon(
                 Icons.explore,
                 color: Color(0xFFF1C40F),
                 size: 22,
@@ -466,6 +614,7 @@ class _ScannerScreenState extends State<ScannerScreen>
         children: [
           const SizedBox(height: 60), // décale légèrement vers le haut du centre
           SizedBox(
+            key: _frameKey,
             width: 260,
             height: 364,
             child: Stack(
@@ -511,18 +660,51 @@ class _ScannerScreenState extends State<ScannerScreen>
             ),
           ),
           const SizedBox(height: 20),
-          // Hint
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-            decoration: BoxDecoration(
-              color: Colors.black.withValues(alpha: 0.5),
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: const Text(
-              'Pointez vers le numéro de carte',
-              style: TextStyle(color: Colors.white60, fontSize: 12, fontWeight: FontWeight.w500),
-            ),
-          )
+          // Badge "carte détectée" (auto-scan)
+          if (_detectedCardNumber != null)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+              decoration: BoxDecoration(
+                color: const Color(0xFF0D3320),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: const Color(0xFF27AE60), width: 1),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.check_circle, color: Color(0xFF2ECC71), size: 14),
+                  const SizedBox(width: 6),
+                  Text(
+                    _detectedCardNumber!,
+                    style: const TextStyle(
+                      color: Color(0xFF2ECC71),
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                ],
+              ),
+            )
+            .animate()
+            .fadeIn(duration: 200.ms)
+            .scaleXY(begin: 0.85, end: 1.0, duration: 200.ms)
+          else
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.5),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Text(
+                _autoScanEnabled ? 'Auto-scan actif...' : 'Pointez vers le numéro de carte',
+                style: TextStyle(
+                  color: _autoScanEnabled ? const Color(0xFF2ECC71) : Colors.white60,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            )
               .animate(onPlay: (c) => c.repeat(reverse: true))
               .fadeIn(duration: 1200.ms)
               .then()
@@ -666,8 +848,30 @@ class _ScannerScreenState extends State<ScannerScreen>
                     .animate(onPlay: (c) => c.repeat(reverse: true))
                     .scaleXY(begin: 1.0, end: 1.03, duration: 1400.ms, curve: Curves.easeInOut),
                 const SizedBox(width: 28),
-                // Spacer symétrique
-                const SizedBox(width: 44, height: 44),
+                // Bouton auto-scan
+                GestureDetector(
+                  onTap: _toggleAutoScan,
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 250),
+                    width: 44,
+                    height: 44,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: _autoScanEnabled
+                          ? const Color(0xFF1E5F3A)
+                          : Colors.white.withValues(alpha: 0.08),
+                      border: Border.all(
+                        color: _autoScanEnabled ? const Color(0xFF27AE60) : Colors.white24,
+                        width: 1.5,
+                      ),
+                    ),
+                    child: Icon(
+                      _autoScanEnabled ? Icons.sensors : Icons.sensors_off,
+                      color: _autoScanEnabled ? const Color(0xFF2ECC71) : Colors.white54,
+                      size: 20,
+                    ),
+                  ),
+                ),
               ],
             ),
           ],

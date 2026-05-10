@@ -34,6 +34,7 @@ dependencies:
   google_fonts: ^6.2.1
   # Ouverture de liens externes (Cardmarket)
   url_launcher: ^6.3.1
+  image: ^4.8.0
 
 dev_dependencies:
   flutter_test:
