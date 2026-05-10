@@ -1,6 +1,6 @@
 # OP Card Scanner — One Piece TCG
 
-> **⚡ Projet 100% Vibe Coded** — Entièrement généré et itéré avec GitHub Copilot (Claude Sonnet 4.6), sans une seule ligne de code écrite à la main. De l'architecture aux animations, chaque feature a été décrite en langage naturel et implémentée par l'IA en temps réel.
+> **⚡ Projet 100% Vibe Coded** — Entièrement généré et itéré avec GitHub Copilot (Claude Sonnet 4.6). De l'architecture aux animations, chaque feature a été décrite en langage naturel et implémentée par l'IA en temps réel.
 
 ---
 
