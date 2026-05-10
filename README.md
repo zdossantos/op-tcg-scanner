@@ -87,21 +87,6 @@ flutter run
 | iOS | `NSCameraUsageDescription` (Info.plist) |
 | Android | `CAMERA` (AndroidManifest.xml) |
 
----
-
-## À propos du Vibe Coding
-
-Ce projet n'a pas été écrit "à la main". Chaque fonctionnalité a été demandée en français à GitHub Copilot :
-
-- *"Intègre un système d'auto-scan qui scanne en continu et affiche si il détecte un truc"*
-- *"Le scan scanne tout ce qu'il y a à l'écran, pas que ce qui est dans le cadre"*
-- *"Fait moi un truc plus moderne avec le logo One Piece"*
-
-L'IA a produit l'architecture, les services, les widgets, les animations, les corrections de bugs, et même ce README — le tout sans jamais écrire une ligne manuellement.
-
-C'est une démonstration concrète de ce qu'on peut construire avec du **Vibe Coding** : une app mobile complète et fonctionnelle, en quelques heures de conversation.
-
----
 
 ## Disclaimer
 
