@@ -1,13 +1,16 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:image/image.dart' as img;
+import 'package:shared_preferences/shared_preferences.dart';
 import '../services/vision_service.dart';
 import '../services/cardmarket_service.dart';
 import '../models/card_model.dart';
 import 'result_screen.dart';
+import 'chain_scan_result_screen.dart';
 
 class ScannerScreen extends StatefulWidget {
   const ScannerScreen({super.key});
@@ -33,6 +36,10 @@ class _ScannerScreenState extends State<ScannerScreen>
   bool _isAutoProcessing = false;
   String? _detectedCardNumber;
   Timer? _autoScanTimer;
+
+  // Chain scan
+  bool _chainScanMode = false;
+  final List<CardModel> _chainScannedCards = [];
 
   late final AnimationController _laserController;
 
@@ -107,7 +114,22 @@ class _ScannerScreenState extends State<ScannerScreen>
       _autoScanTimer = null;
       setState(() { _autoScanEnabled = false; _detectedCardNumber = null; });
     } else {
+      // Disable chain scan if active
+      if (_chainScanMode) setState(() => _chainScanMode = false);
       setState(() { _autoScanEnabled = true; _detectedCardNumber = null; _errorMessage = null; });
+      _startAutoScanTimer();
+    }
+  }
+
+  void _toggleChainScan() {
+    if (_chainScanMode) {
+      _autoScanTimer?.cancel();
+      _autoScanTimer = null;
+      setState(() { _chainScanMode = false; _detectedCardNumber = null; });
+    } else {
+      // Disable normal auto-scan if active
+      if (_autoScanEnabled) setState(() { _autoScanEnabled = false; });
+      setState(() { _chainScanMode = true; _detectedCardNumber = null; _errorMessage = null; });
       _startAutoScanTimer();
     }
   }
@@ -131,20 +153,32 @@ class _ScannerScreenState extends State<ScannerScreen>
 
       if (!mounted || scanResult.cardNumber == null) return;
 
-      // Carte détectée → pause timer + feedback visuel + scan complet
-      _autoScanTimer?.cancel();
-      _autoScanTimer = null;
-      setState(() {
-        _detectedCardNumber = scanResult.cardNumber;
-        _isScanning = true;
-        _errorMessage = null;
-      });
+      if (_chainScanMode) {
+        // Chain scan: process silently, no overlay
+        _autoScanTimer?.cancel();
+        _autoScanTimer = null;
+        setState(() { _detectedCardNumber = scanResult.cardNumber; });
+        await _performScan(scanResult);
+        if (mounted && _chainScanMode) {
+          setState(() { _detectedCardNumber = null; });
+          _startAutoScanTimer();
+        }
+      } else {
+        // Regular auto-scan: pause timer + feedback visuel + scan complet
+        _autoScanTimer?.cancel();
+        _autoScanTimer = null;
+        setState(() {
+          _detectedCardNumber = scanResult.cardNumber;
+          _isScanning = true;
+          _errorMessage = null;
+        });
 
-      await _performScan(scanResult);
+        await _performScan(scanResult);
 
-      if (mounted && _autoScanEnabled) {
-        setState(() { _detectedCardNumber = null; _isScanning = false; });
-        _startAutoScanTimer();
+        if (mounted && _autoScanEnabled) {
+          setState(() { _detectedCardNumber = null; _isScanning = false; });
+          _startAutoScanTimer();
+        }
       }
     } catch (_) {
       // Ignore silencieusement les erreurs en auto-scan
@@ -159,7 +193,7 @@ class _ScannerScreenState extends State<ScannerScreen>
     if (_isScanning || _cameraController == null) return;
     if (!_cameraController!.value.isInitialized) return;
 
-    // Pause l'auto-scan pendant le scan manuel
+    // Pause l'auto-scan et le mode chaîne pendant le scan manuel
     _autoScanTimer?.cancel();
     _autoScanTimer = null;
 
@@ -185,6 +219,7 @@ class _ScannerScreenState extends State<ScannerScreen>
       if (mounted) {
         setState(() => _isScanning = false);
         if (_autoScanEnabled) _startAutoScanTimer();
+        if (_chainScanMode) _startAutoScanTimer();
       }
     }
   }
@@ -226,12 +261,98 @@ class _ScannerScreenState extends State<ScannerScreen>
 
     if (!mounted) return;
 
+    if (_chainScanMode) {
+      // En mode chaîne : ajouter à la session sans naviguer
+      _addToChainScan(cards.first);
+      return;
+    }
+
     if (cards.length == 1) {
       await _navigateToResult(cards.first, warningMessage);
     } else {
       if (mounted) setState(() => _isScanning = false);
       await _showVariantSelector(cards, warningMessage);
     }
+  }
+
+  /// Ajoute une carte à la session chaîne et affiche un toast de confirmation.
+  Future<void> _addToChainScan(CardModel card) async {
+    if (!mounted) return;
+
+    // Évite les doublons dans la session
+    final alreadyScanned = _chainScannedCards.any(
+      (c) => c.cardNumber == card.cardNumber && c.id == card.id,
+    );
+
+    if (alreadyScanned) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.info_outline, color: Colors.white70, size: 16),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    '${card.name} déjà dans la session',
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+            duration: const Duration(seconds: 2),
+            backgroundColor: const Color(0xFF1A1A2E),
+          ),
+        );
+      return;
+    }
+
+    setState(() => _chainScannedCards.add(card));
+    await _saveCardToHistory(card);
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              const Icon(Icons.check_circle, color: Color(0xFF2ECC71), size: 16),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Scan réussi · ${card.name}',
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+            ],
+          ),
+          duration: const Duration(seconds: 2),
+          backgroundColor: const Color(0xFF0D3320),
+        ),
+      );
+  }
+
+  /// Sauvegarde une carte dans l'historique persistant.
+  Future<void> _saveCardToHistory(CardModel card) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final List<String> history = prefs.getStringList('scan_history') ?? [];
+      final cardJson = jsonEncode(card.toJson());
+      history.removeWhere((item) {
+        try {
+          final map = jsonDecode(item) as Map<String, dynamic>;
+          return map['id'] == card.id;
+        } catch (_) {
+          return false;
+        }
+      });
+      history.insert(0, cardJson);
+      if (history.length > 50) history.removeRange(50, history.length);
+      await prefs.setStringList('scan_history', history);
+    } catch (_) {}
   }
 
   /// Recadre l'image capturée aux coordonnées exactes du cadre de scan affiché.
@@ -534,6 +655,68 @@ class _ScannerScreenState extends State<ScannerScreen>
             // Logo + titre
             _buildLogo(),
             const Spacer(),
+            // Bouton mode chaîne
+            GestureDetector(
+              onTap: _toggleChainScan,
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 250),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: _chainScanMode
+                      ? const Color(0xFF2ECC71).withValues(alpha: 0.15)
+                      : Colors.white.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(
+                    color: _chainScanMode
+                        ? const Color(0xFF27AE60)
+                        : Colors.white24,
+                    width: 1,
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.link,
+                      color: _chainScanMode
+                          ? const Color(0xFF2ECC71)
+                          : Colors.white70,
+                      size: 16,
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      'Chaîne',
+                      style: TextStyle(
+                        color: _chainScanMode
+                            ? const Color(0xFF2ECC71)
+                            : Colors.white70,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    if (_chainScanMode && _chainScannedCards.isNotEmpty) ...[
+                      const SizedBox(width: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF2ECC71),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Text(
+                          '${_chainScannedCards.length}',
+                          style: const TextStyle(
+                            color: Colors.black,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
             // Bouton historique
             GestureDetector(
               onTap: () => Navigator.pushNamed(context, '/history'),
@@ -697,9 +880,17 @@ class _ScannerScreenState extends State<ScannerScreen>
                 borderRadius: BorderRadius.circular(20),
               ),
               child: Text(
-                _autoScanEnabled ? 'Auto-scan actif...' : 'Pointez vers le numéro de carte',
+                _chainScanMode
+                    ? 'Mode chaîne actif...'
+                    : _autoScanEnabled
+                        ? 'Auto-scan actif...'
+                        : 'Pointez vers le numéro de carte',
                 style: TextStyle(
-                  color: _autoScanEnabled ? const Color(0xFF2ECC71) : Colors.white60,
+                  color: _chainScanMode
+                      ? const Color(0xFF2ECC71)
+                      : _autoScanEnabled
+                          ? const Color(0xFF2ECC71)
+                          : Colors.white60,
                   fontSize: 12,
                   fontWeight: FontWeight.w500,
                 ),
@@ -766,6 +957,64 @@ class _ScannerScreenState extends State<ScannerScreen>
         ),
         child: Column(
           children: [
+            // Bouton "Voir la session" (mode chaîne)
+            if (_chainScanMode && _chainScannedCards.isNotEmpty)
+              GestureDetector(
+                onTap: () => Navigator.push(
+                  context,
+                  PageRouteBuilder(
+                    pageBuilder: (context, animation, secondaryAnimation) =>
+                        ChainScanResultScreen(
+                      cards: List.from(_chainScannedCards),
+                      onClear: () => setState(() => _chainScannedCards.clear()),
+                    ),
+                    transitionsBuilder:
+                        (context, animation, secondaryAnimation, child) =>
+                            FadeTransition(opacity: animation, child: child),
+                    transitionDuration: const Duration(milliseconds: 350),
+                  ),
+                ),
+                child: Container(
+                  margin: const EdgeInsets.only(bottom: 12),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0D3320),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(
+                        color: const Color(0xFF27AE60), width: 1.5),
+                    boxShadow: [
+                      BoxShadow(
+                        color: const Color(0xFF27AE60).withValues(alpha: 0.25),
+                        blurRadius: 12,
+                        spreadRadius: 1,
+                      ),
+                    ],
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(Icons.link,
+                          color: Color(0xFF2ECC71), size: 18),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Voir la session · ${_chainScannedCards.length} carte${_chainScannedCards.length > 1 ? 's' : ''}',
+                        style: const TextStyle(
+                          color: Color(0xFF2ECC71),
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      const Icon(Icons.arrow_forward_ios,
+                          color: Color(0xFF2ECC71), size: 14),
+                    ],
+                  ),
+                ),
+              )
+                  .animate()
+                  .fadeIn(duration: 300.ms)
+                  .slideY(begin: 0.2, duration: 250.ms, curve: Curves.easeOut),
             // Erreur
             if (_errorMessage != null)
               GestureDetector(
